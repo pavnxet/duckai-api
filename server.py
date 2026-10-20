@@ -4,9 +4,10 @@ import logging
 import os
 import time
 import uuid
+from contextlib import asynccontextmanager
 from typing import List, Optional, Union, Dict, Any
 
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -21,33 +22,45 @@ logger = logging.getLogger("DuckAI-Server")
 PORT = int(os.environ.get("PORT", 3006))
 HOST = os.environ.get("HOST", "0.0.0.0")
 HEADLESS = os.environ.get("HEADLESS", "true").lower() in ("true", "1", "yes")
+API_KEY = os.environ.get("API_KEY", "").strip()
+
+bridge = DuckAIBridge(headless=HEADLESS)
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("DuckAI Server starting up...")
+    asyncio.create_task(bridge.initialize())
+    yield
+    logger.info("DuckAI Server shutting down...")
+    await bridge.close()
 
 app = FastAPI(
     title="DuckAI OpenAI-Compatible API",
-    description="Reverse-engineered Duck.ai OpenAI-compatible API proxy server.",
-    version="1.0.0"
+    description="Hardened reverse-engineered Duck.ai OpenAI-compatible API proxy server.",
+    version="1.1.0",
+    lifespan=lifespan
 )
 
-# Enable CORS for third-party web apps
+# Fix H1: Compliant CORS configuration (wildcard origins with credentials=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-bridge = DuckAIBridge(headless=HEADLESS)
-
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting up DuckAI API Proxy...")
-    asyncio.create_task(bridge.initialize())
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    logger.info("Shutting down DuckAI API Proxy...")
-    await bridge.close()
+def verify_api_key(request: Request):
+    """Enforces API Key verification if API_KEY is set in environment (Fixes H1)."""
+    if not API_KEY:
+        return
+    auth_header = request.headers.get("Authorization", "")
+    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else request.query_params.get("api_key")
+    if token != API_KEY:
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid or missing API key."
+        )
 
 # Pydantic Request Models
 class Message(BaseModel):
@@ -60,6 +73,23 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     temperature: Optional[float] = 0.7
     max_tokens: Optional[int] = None
+
+def extract_text_content(content: Union[str, List[Any]]) -> str:
+    """Safely extracts text strings from multi-part content arrays (Fixes M1)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                if item.get("type") == "text" and "text" in item:
+                    parts.append(str(item["text"]))
+                elif "content" in item and isinstance(item["content"], str):
+                    parts.append(str(item["content"]))
+        return "\n".join(parts) if parts else json.dumps(content)
+    return str(content)
 
 # Static UI Route
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
@@ -80,34 +110,43 @@ async def health_check():
         "status": "healthy",
         "service": "duckai-api",
         "bridge_ready": bridge._is_ready,
+        "auth_enabled": bool(API_KEY),
         "models_count": len(AVAILABLE_MODELS)
     }
 
-@app.get("/v1/models")
+@app.get("/v1/models", dependencies=[Depends(verify_api_key)])
 async def list_models():
     return {
         "object": "list",
         "data": AVAILABLE_MODELS
     }
 
-@app.post("/v1/chat/completions")
-async def chat_completions(req: ChatCompletionRequest):
+@app.post("/v1/chat/completions", dependencies=[Depends(verify_api_key)])
+async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages array cannot be empty.")
 
-    # Format messages into conversation prompt
-    if len(req.messages) == 1:
-        user_content = req.messages[0].content
-        prompt = user_content if isinstance(user_content, str) else json.dumps(user_content)
+    # Format messages into conversation prompt with system instruction awareness (Fixes M1, M2)
+    dialogue = []
+    for msg in req.messages:
+        text = extract_text_content(msg.content).strip()
+        if not text:
+            continue
+        if msg.role == "system":
+            dialogue.append(f"[System Instruction: {text}]")
+        elif msg.role == "user":
+            dialogue.append(f"User: {text}")
+        elif msg.role == "assistant":
+            dialogue.append(f"Assistant: {text}")
+        else:
+            dialogue.append(f"{msg.role.capitalize()}: {text}")
+
+    if len(dialogue) == 1 and dialogue[0].startswith("User: "):
+        # Single user prompt - strip prefix for cleanest model response
+        prompt = dialogue[0][6:]
     else:
-        # Multi-turn context synthesis
-        dialogue = []
-        for msg in req.messages:
-            content_str = msg.content if isinstance(msg.content, str) else json.dumps(msg.content)
-            role_prefix = "User" if msg.role == "user" else "Assistant" if msg.role == "assistant" else "System"
-            dialogue.append(f"{role_prefix}: {content_str}")
         dialogue.append("Assistant:")
-        prompt = "\n".join(dialogue)
+        prompt = "\n\n".join(dialogue)
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
@@ -131,8 +170,8 @@ async def chat_completions(req: ChatCompletionRequest):
                 }
                 yield f"data: {json.dumps(first_chunk)}\n\n"
 
-                # Stream token deltas
-                async for token in bridge.ask_stream(prompt, target_model):
+                # Stream token deltas with client disconnect checking (Fixes H6)
+                async for token in bridge.ask_stream(prompt, target_model, is_aborted=request.is_disconnected):
                     chunk = {
                         "id": completion_id,
                         "object": "chat.completion.chunk",
@@ -189,7 +228,7 @@ async def chat_completions(req: ChatCompletionRequest):
     # Non-Streaming Mode
     try:
         full_tokens = []
-        async for token in bridge.ask_stream(prompt, target_model):
+        async for token in bridge.ask_stream(prompt, target_model, is_aborted=request.is_disconnected):
             full_tokens.append(token)
         full_text = "".join(full_tokens)
 
@@ -215,6 +254,9 @@ async def chat_completions(req: ChatCompletionRequest):
                 "total_tokens": prompt_len + comp_len
             }
         })
+    except TimeoutError as te:
+        logger.error(f"Bridge busy/timeout: {te}")
+        raise HTTPException(status_code=503, detail="Server busy: Bridge queue timeout.")
     except Exception as e:
         logger.error(f"Error in non-streaming completion: {e}")
         raise HTTPException(status_code=500, detail=str(e))

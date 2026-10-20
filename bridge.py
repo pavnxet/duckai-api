@@ -3,7 +3,7 @@ import json
 import logging
 import time
 import uuid
-from typing import AsyncGenerator, Optional, Dict, Any
+from typing import AsyncGenerator, Optional, Dict, Any, Callable, Awaitable
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -102,104 +102,131 @@ class DuckAIBridge:
         self.context: Optional[BrowserContext] = None
         self.page: Optional[Page] = None
         self.lock = asyncio.Lock()
-        self.current_queue: Optional[asyncio.Queue] = None
+        self._init_lock = asyncio.Lock()
+        
+        # Generation-scoped tracking (prevents C1 cross-request token contamination)
+        self.active_generation_id: Optional[str] = None
+        self.active_queue: Optional[asyncio.Queue] = None
         self._is_ready = False
 
     async def initialize(self):
-        logger.info(f"Initializing DuckAI Browser Bridge (headless={self.headless})...")
-        self.playwright = await async_playwright().start()
-        
-        # Chrome path on Windows fallback to Edge if needed
-        chrome_path = "C:/Program Files/Google/Chrome/Application/chrome.exe"
-        edge_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
-        import os
-        executable_path = chrome_path if os.path.exists(chrome_path) else edge_path
+        async with self._init_lock:
+            if self._is_ready and self.page and not self.page.is_closed():
+                return
 
-        self.browser = await self.playwright.chromium.launch(
-            executable_path=executable_path,
-            headless=self.headless,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu"
-            ]
-        )
+            logger.info(f"Initializing DuckAI Browser Bridge (headless={self.headless})...")
+            if not self.playwright:
+                self.playwright = await async_playwright().start()
+            
+            # Chrome path on Windows fallback to Edge if needed
+            chrome_path = "C:/Program Files/Google/Chrome/Application/chrome.exe"
+            edge_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+            import os
+            executable_path = chrome_path if os.path.exists(chrome_path) else edge_path
 
-        self.context = await self.browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            viewport={"width": 1280, "height": 800}
-        )
+            self.browser = await self.playwright.chromium.launch(
+                executable_path=executable_path,
+                headless=self.headless,
+                args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu"
+                ]
+            )
 
-        # Anti-detection: mask navigator.webdriver
-        await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
+            self.context = await self.browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800}
+            )
 
-        self.page = await self.context.new_page()
+            # Anti-detection: mask navigator.webdriver
+            await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
-        # Expose python bridge for incoming SSE tokens
-        async def on_bridge_message(raw_json: str):
-            if self.current_queue:
-                if raw_json == "[DONE]":
-                    await self.current_queue.put(None)
+            self.page = await self.context.new_page()
+
+            # Expose python bridge with generation-id validation
+            async def on_bridge_message(gen_id: str, raw_json: str):
+                # Reject stale frames from prior or superseded generations (Fixes C1)
+                if not self.active_generation_id or gen_id != self.active_generation_id:
                     return
+
+                if not self.active_queue:
+                    return
+
+                if raw_json == "[DONE]":
+                    await self.active_queue.put(None)
+                    return
+
                 if not raw_json or raw_json.startswith("["):
-                    return  # Ignore other control frames like [PING], [CHAT_TITLE:...]
+                    # Control frame like [PING], [CHAT_TITLE:...]
+                    return
+
                 try:
                     data = json.loads(raw_json)
-                    if data.get("action") == "success" and "message" in data:
+                    action = data.get("action")
+                    if action == "success" and "message" in data:
                         token = data["message"]
-                        await self.current_queue.put(token)
-                except Exception:
-                    pass
+                        await self.active_queue.put(token)
+                    elif action == "error" or data.get("type", "").startswith("ERR_"):
+                        # Forward explicit DuckAI error frame (Fixes H2)
+                        err_type = data.get("type", "ERR_UNKNOWN")
+                        err_msg = data.get("message", f"DuckAI Error: {err_type}")
+                        logger.error(f"DuckAI returned error payload: {err_type} - {err_msg}")
+                        await self.active_queue.put(RuntimeError(f"{err_type}: {err_msg}"))
+                except Exception as e:
+                    logger.debug(f"Frame parsing notice: {e}")
 
-        await self.page.expose_function("py_duckai_sse", on_bridge_message)
+            await self.page.expose_function("py_duckai_sse", on_bridge_message)
 
-        # Intercept fetch for /duckchat/v1/chat to stream tokens directly
-        await self.page.add_init_script("""
-            const origFetch = window.fetch;
-            window.fetch = async function(...args) {
-                const res = await origFetch.apply(this, args);
-                const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
-                if (url.includes('duckchat/v1/chat')) {
-                    const cloned = res.clone();
-                    (async () => {
-                        const reader = cloned.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buf = '';
-                        while (true) {
-                            const { done, value } = await reader.read();
-                            if (done) break;
-                            buf += decoder.decode(value, { stream: true });
-                            const lines = buf.split('\\n');
-                            buf = lines.pop();
-                            for (const line of lines) {
-                                if (line.startsWith('data: ')) {
-                                    const payload = line.slice(6).trim();
-                                    if (payload.startsWith('[DONE]')) {
-                                        window.py_duckai_sse('[DONE]');
-                                    } else if (payload) {
-                                        window.py_duckai_sse(payload);
+            # Intercept fetch for /duckchat/v1/chat to stream tokens tagged with generation ID
+            await self.page.add_init_script("""
+                const origFetch = window.fetch;
+                window.fetch = async function(...args) {
+                    const res = await origFetch.apply(this, args);
+                    const url = typeof args[0] === 'string' ? args[0] : (args[0] && args[0].url ? args[0].url : '');
+                    if (url.includes('duckchat/v1/chat')) {
+                        const currentGenId = window.__DUCKAI_CURRENT_GEN_ID__ || 'unknown';
+                        const cloned = res.clone();
+                        (async () => {
+                            const reader = cloned.body.getReader();
+                            const decoder = new TextDecoder();
+                            let buf = '';
+                            while (true) {
+                                const { done, value } = await reader.read();
+                                if (done) break;
+                                buf += decoder.decode(value, { stream: true });
+                                const lines = buf.split('\\n');
+                                buf = lines.pop();
+                                for (const line of lines) {
+                                    if (line.startsWith('data: ')) {
+                                        const payload = line.slice(6).trim();
+                                        if (payload.startsWith('[DONE]')) {
+                                            window.py_duckai_sse(currentGenId, '[DONE]');
+                                        } else if (payload) {
+                                            window.py_duckai_sse(currentGenId, payload);
+                                        }
                                     }
                                 }
                             }
-                        }
-                    })().catch(err => console.error('Fetch stream reader error:', err));
-                }
-                return res;
-            };
-        """)
+                        })().catch(err => console.error('Fetch stream reader error:', err));
+                    }
+                    return res;
+                };
+            """)
 
-        logger.info("Navigating to https://duck.ai/ ...")
-        await self.page.goto("https://duck.ai/", wait_until="networkidle")
-        await self.page.wait_for_selector("textarea", timeout=20000)
-        self._is_ready = True
-        logger.info("DuckAI Browser Bridge ready!")
+            logger.info("Navigating to https://duck.ai/ ...")
+            await self.page.goto("https://duck.ai/", wait_until="networkidle")
+            await self.page.wait_for_selector("textarea", timeout=20000)
+            self._is_ready = True
+            logger.info("DuckAI Browser Bridge ready!")
 
     async def switch_model(self, target_model: str):
         """Switches the active model in DuckAI's UI using direct testids."""
         model_key = MODEL_MAP.get(target_model.lower(), "gpt-6-luna")
         testid = MODEL_TESTIDS.get(model_key)
         if not testid:
+            logger.warning(f"No testid found for model '{target_model}', defaulting to gpt-6-luna")
             return
 
         model_keywords = {
@@ -213,7 +240,6 @@ class DuckAIBridge:
         target_words = model_keywords.get(model_key, ["Luna"])
 
         try:
-            # Find the model dropdown trigger button in prompt toolbar
             buttons = await self.page.query_selector_all("button")
             model_btn = None
             for b in buttons:
@@ -223,13 +249,12 @@ class DuckAIBridge:
                     break
 
             if not model_btn:
-                logger.warning("Model selector button not found.")
+                logger.warning("Model selector button not found in UI.")
                 return
 
             current_txt = (await model_btn.inner_text()).strip()
             if any(w.lower() in current_txt.lower() for w in target_words):
-                logger.info(f"Model already active: {current_txt}")
-                return
+                return  # Model is already active
 
             # Open dropdown
             await model_btn.click()
@@ -248,19 +273,45 @@ class DuckAIBridge:
             logger.warning(f"Notice on model switch: {e}")
 
     async def new_chat(self):
-        """Resets the conversation to a fresh state."""
+        """Resets the conversation and ensures textarea is empty (Fixes H4)."""
         try:
             new_btn = await self.page.query_selector("button:has-text('New Chat'), button[aria-label*='New Chat']")
             if new_btn:
                 await new_btn.click()
                 await asyncio.sleep(0.5)
+            # Ensure textarea is clear
+            textarea = await self.page.query_selector("textarea")
+            if textarea:
+                await textarea.fill("")
         except Exception as e:
             logger.warning(f"Notice on new_chat reset: {e}")
 
-    async def ask_stream(self, prompt: str, model: str = "gpt-6-luna") -> AsyncGenerator[str, None]:
-        """Submits prompt to DuckAI and yields token chunks asynchronously."""
-        async with self.lock:
-            if not self._is_ready or not self.page:
+    async def stop_generation(self):
+        """Clicks Stop generating if active and clears current generation (Fixes H6)."""
+        try:
+            self.active_generation_id = None
+            stop_btn = await self.page.query_selector("button[aria-label*='Stop generating']")
+            if stop_btn:
+                await stop_btn.click()
+                logger.info("Clicked 'Stop generating' button on DuckAI.")
+        except Exception as e:
+            logger.debug(f"Stop generation notice: {e}")
+
+    async def ask_stream(
+        self,
+        prompt: str,
+        model: str = "gpt-6-luna",
+        is_aborted: Optional[Callable[[], Awaitable[bool]]] = None
+    ) -> AsyncGenerator[str, None]:
+        """Submits prompt to DuckAI and yields token chunks asynchronously with generation safety."""
+        # Acquisition timeout to prevent indefinite head-of-line blocking (Fixes H5)
+        try:
+            await asyncio.wait_for(self.lock.acquire(), timeout=30.0)
+        except asyncio.TimeoutError:
+            raise TimeoutError("Server busy: Bridge queue timeout waiting for lock.")
+
+        try:
+            if not self._is_ready or not self.page or self.page.is_closed():
                 await self.initialize()
 
             # Start fresh chat first
@@ -269,8 +320,13 @@ class DuckAIBridge:
             # Switch model AFTER new_chat so selection is preserved
             await self.switch_model(model)
 
+            # Assign fresh unique generation ID (Fixes C1)
+            gen_id = str(uuid.uuid4())
+            self.active_generation_id = gen_id
+            await self.page.evaluate(f"window.__DUCKAI_CURRENT_GEN_ID__ = '{gen_id}';")
+
             queue = asyncio.Queue()
-            self.current_queue = queue
+            self.active_queue = queue
 
             try:
                 # Find textarea and submit
@@ -283,18 +339,30 @@ class DuckAIBridge:
                 else:
                     await textarea.press("Enter")
 
-                # Stream tokens from queue until generation finishes (sentinel None)
+                # Stream tokens from queue
                 while True:
+                    # Check if client disconnected mid-stream (Fixes H6)
+                    if is_aborted and await is_aborted():
+                        logger.info(f"Client disconnected during generation {gen_id}. Halting stream.")
+                        await self.stop_generation()
+                        break
+
                     try:
-                        token = await asyncio.wait_for(queue.get(), timeout=25.0)
-                        if token is None:
+                        item = await asyncio.wait_for(queue.get(), timeout=25.0)
+                        if item is None:
                             break  # [DONE] received from DuckAI
-                        yield token
+                        if isinstance(item, Exception):
+                            # Surface DuckAI error frame (Fixes H2)
+                            raise item
+                        yield item
                     except asyncio.TimeoutError:
-                        logger.warning("Token streaming timed out waiting for next chunk.")
+                        logger.warning(f"Generation {gen_id} timed out waiting for token chunk.")
                         break
             finally:
-                self.current_queue = None
+                self.active_generation_id = None
+                self.active_queue = None
+        finally:
+            self.lock.release()
 
     async def close(self):
         logger.info("Closing DuckAI bridge...")
