@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import os
 import time
 import uuid
 from typing import AsyncGenerator, Optional, Dict, Any, Callable, Awaitable
@@ -109,6 +110,65 @@ class DuckAIBridge:
         self.active_queue: Optional[asyncio.Queue] = None
         self._is_ready = False
 
+        # Automated Memory Recycling configuration
+        self.request_count = 0
+        self.max_requests_before_recycle = int(os.environ.get("RECYCLE_AFTER_REQUESTS", "100"))
+        self.last_recycle_time = time.time()
+        self.recycle_interval_seconds = int(os.environ.get("RECYCLE_INTERVAL_HOURS", "24")) * 3600
+
+    async def _setup_page(self, page: Page):
+        """Attaches python SSE bridge to page, navigates, and verifies readiness."""
+        async def on_bridge_message(gen_id: str, raw_json: str):
+            if not self.active_generation_id or gen_id != self.active_generation_id:
+                return
+
+            if not self.active_queue:
+                return
+
+            if raw_json == "[DONE]":
+                await self.active_queue.put(None)
+                return
+
+            if not raw_json or raw_json.startswith("["):
+                return
+
+            try:
+                data = json.loads(raw_json)
+                action = data.get("action")
+                if action == "success" and "message" in data:
+                    token = data["message"]
+                    await self.active_queue.put(token)
+                elif action == "error" or data.get("type", "").startswith("ERR_"):
+                    err_type = data.get("type", "ERR_UNKNOWN")
+                    err_msg = data.get("message", f"DuckAI Error: {err_type}")
+                    logger.error(f"DuckAI returned error payload: {err_type} - {err_msg}")
+                    await self.active_queue.put(RuntimeError(f"{err_type}: {err_msg}"))
+            except Exception as e:
+                logger.debug(f"Frame parsing notice: {e}")
+
+        await page.expose_function("py_duckai_sse", on_bridge_message)
+
+        logger.info("Navigating to https://duck.ai/ ...")
+        await page.goto("https://duck.ai/", wait_until="networkidle")
+        await page.wait_for_selector("textarea", timeout=20000)
+
+    async def recycle_page(self):
+        """Recycles the browser page to flush memory, accumulated DOM trees, and JS heap."""
+        logger.info(f"Recycling DuckAI page (handled {self.request_count} requests)...")
+        try:
+            if self.page and not self.page.is_closed():
+                await self.page.close()
+            
+            self.page = await self.context.new_page()
+            await self._setup_page(self.page)
+            self.request_count = 0
+            self.last_recycle_time = time.time()
+            logger.info("DuckAI browser page successfully recycled and ready!")
+        except Exception as e:
+            logger.error(f"Error during page recycling: {e}")
+            self._is_ready = False
+            await self.initialize()
+
     async def initialize(self):
         async with self._init_lock:
             if self._is_ready and self.page and not self.page.is_closed():
@@ -129,7 +189,6 @@ class DuckAIBridge:
             # Chrome path on Windows fallback to Edge if needed
             chrome_path = "C:/Program Files/Google/Chrome/Application/chrome.exe"
             edge_path = "C:/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
-            import os
             executable_path = chrome_path if os.path.exists(chrome_path) else edge_path
 
             self.browser = await self.playwright.chromium.launch(
@@ -151,44 +210,8 @@ class DuckAIBridge:
             # Anti-detection: mask navigator.webdriver
             await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', { get: () => undefined });")
 
-            self.page = await self.context.new_page()
-
-            # Expose python bridge with generation-id validation
-            async def on_bridge_message(gen_id: str, raw_json: str):
-                # Reject stale frames from prior or superseded generations (Fixes C1)
-                if not self.active_generation_id or gen_id != self.active_generation_id:
-                    return
-
-                if not self.active_queue:
-                    return
-
-                if raw_json == "[DONE]":
-                    await self.active_queue.put(None)
-                    return
-
-                if not raw_json or raw_json.startswith("["):
-                    # Control frame like [PING], [CHAT_TITLE:...]
-                    return
-
-                try:
-                    data = json.loads(raw_json)
-                    action = data.get("action")
-                    if action == "success" and "message" in data:
-                        token = data["message"]
-                        await self.active_queue.put(token)
-                    elif action == "error" or data.get("type", "").startswith("ERR_"):
-                        # Forward explicit DuckAI error frame (Fixes H2)
-                        err_type = data.get("type", "ERR_UNKNOWN")
-                        err_msg = data.get("message", f"DuckAI Error: {err_type}")
-                        logger.error(f"DuckAI returned error payload: {err_type} - {err_msg}")
-                        await self.active_queue.put(RuntimeError(f"{err_type}: {err_msg}"))
-                except Exception as e:
-                    logger.debug(f"Frame parsing notice: {e}")
-
-            await self.page.expose_function("py_duckai_sse", on_bridge_message)
-
-            # Intercept fetch for /duckchat/v1/chat to stream tokens tagged with generation ID
-            await self.page.add_init_script("""
+            # Intercept fetch for /duckchat/v1/chat on context level to stream tokens tagged with generation ID
+            await self.context.add_init_script("""
                 const origFetch = window.fetch;
                 window.fetch = async function(...args) {
                     const res = await origFetch.apply(this, args);
@@ -223,9 +246,8 @@ class DuckAIBridge:
                 };
             """)
 
-            logger.info("Navigating to https://duck.ai/ ...")
-            await self.page.goto("https://duck.ai/", wait_until="networkidle")
-            await self.page.wait_for_selector("textarea", timeout=20000)
+            self.page = await self.context.new_page()
+            await self._setup_page(self.page)
             self._is_ready = True
             logger.info("DuckAI Browser Bridge ready!")
 
@@ -319,6 +341,12 @@ class DuckAIBridge:
                     acquired = True
             except TimeoutError:
                 raise TimeoutError("Server busy: Bridge queue timeout waiting for lock.")
+
+            # Automated Memory Recycling check
+            self.request_count += 1
+            if (self.request_count > self.max_requests_before_recycle or
+                time.time() - self.last_recycle_time >= self.recycle_interval_seconds):
+                await self.recycle_page()
 
             if not self._is_ready or not self.page or self.page.is_closed():
                 await self.initialize()

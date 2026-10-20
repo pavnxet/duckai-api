@@ -117,7 +117,10 @@ async def health_check():
         "service": "duckai-api",
         "bridge_ready": bridge._is_ready,
         "auth_enabled": bool(API_KEY),
-        "models_count": len(AVAILABLE_MODELS)
+        "models_count": len(AVAILABLE_MODELS),
+        "requests_processed": bridge.request_count,
+        "max_requests_before_recycle": bridge.max_requests_before_recycle,
+        "memory_recycling": True
     }
 
 @app.get("/v1/models", dependencies=[Depends(verify_api_key)])
