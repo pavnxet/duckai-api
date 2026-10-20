@@ -1,3 +1,8 @@
+# ==========================================================
+#  duckai-api
+#  https://github.com/pavnxet/duckai-api
+# ==========================================================
+
 FROM python:3.11-slim
 
 # Install system dependencies for Playwright Chromium
