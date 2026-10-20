@@ -1,3 +1,5 @@
+> 🦆 **duckai-api** · https://github.com/pavnxet/duckai-api
+
 <div align="center">
 
 # 🦆 DuckAI API Proxy & Web Chat GUI
