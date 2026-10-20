@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  duckai-api:
+    build: .
+    container_name: duckai-api
+    restart: unless-stopped
+    ports:
+      - "3006:3006"
+    environment:
+      - PORT=3006
+      - HOST=0.0.0.0
+      - HEADLESS=true
+      - API_KEY=
+      - RECYCLE_AFTER_REQUESTS=100
+      - RECYCLE_INTERVAL_HOURS=24
+    ipc: host
