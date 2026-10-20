@@ -45,6 +45,12 @@
 
     <!-- Controls -->
     <div class="flex items-center space-x-3">
+      <!-- Optional API Key Input -->
+      <div class="flex items-center space-x-1.5 bg-gray-800/80 px-2.5 py-1.5 rounded-lg border border-gray-700">
+        <span class="text-xs text-gray-400">🔑</span>
+        <input id="apiKeyInput" type="password" placeholder="API Key (optional)" class="bg-transparent text-xs text-gray-200 placeholder-gray-500 focus:outline-none w-28" />
+      </div>
+
       <!-- Model Dropdown -->
       <div class="flex items-center space-x-2 bg-gray-800/80 px-3 py-1.5 rounded-lg border border-gray-700">
         <span class="text-xs text-gray-400 font-medium">Model:</span>
@@ -123,6 +129,12 @@
     const modelSelect = document.getElementById('modelSelect');
     const newChatBtn = document.getElementById('newChatBtn');
     const welcomeMessage = document.getElementById('welcomeMessage');
+    const apiKeyInput = document.getElementById('apiKeyInput');
+
+    apiKeyInput.value = localStorage.getItem('duckai_api_key') || '';
+    apiKeyInput.addEventListener('change', () => {
+      localStorage.setItem('duckai_api_key', apiKeyInput.value.trim());
+    });
 
     let messages = [];
     let isGenerating = false;
@@ -202,9 +214,15 @@
       let assistantText = '';
 
       try {
+        const reqHeaders = { 'Content-Type': 'application/json' };
+        const key = apiKeyInput.value.trim() || localStorage.getItem('duckai_api_key');
+        if (key) {
+          reqHeaders['Authorization'] = 'Bearer ' + key;
+        }
+
         const response = await fetch('/v1/chat/completions', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: reqHeaders,
           body: JSON.stringify({
             model: modelSelect.value,
             messages: messages,

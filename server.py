@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -37,11 +38,11 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="DuckAI OpenAI-Compatible API",
     description="Hardened reverse-engineered Duck.ai OpenAI-compatible API proxy server.",
-    version="1.1.0",
+    version="1.2.0",
     lifespan=lifespan
 )
 
-# Fix H1: Compliant CORS configuration (wildcard origins with credentials=False)
+# Compliant CORS configuration (wildcard origins with credentials=False)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -51,15 +52,20 @@ app.add_middleware(
 )
 
 def verify_api_key(request: Request):
-    """Enforces API Key verification if API_KEY is set in environment (Fixes H1)."""
+    """Enforces constant-time API Key verification via Authorization header only (Fixes H1, N4)."""
     if not API_KEY:
         return
-    auth_header = request.headers.get("Authorization", "")
-    token = auth_header[7:].strip() if auth_header.startswith("Bearer ") else request.query_params.get("api_key")
-    if token != API_KEY:
+    auth_header = request.headers.get("Authorization", "").strip()
+    if not auth_header.startswith("Bearer "):
         raise HTTPException(
             status_code=401,
-            detail="Unauthorized: Invalid or missing API key."
+            detail="Unauthorized: Missing 'Bearer <API_KEY>' in Authorization header."
+        )
+    token = auth_header[7:].strip()
+    if not hmac.compare_digest(token, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="Unauthorized: Invalid API key."
         )
 
 # Pydantic Request Models
@@ -126,7 +132,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     if not req.messages:
         raise HTTPException(status_code=400, detail="Messages array cannot be empty.")
 
-    # Format messages into conversation prompt with system instruction awareness (Fixes M1, M2)
+    # Format messages into conversation prompt with system instruction awareness
     dialogue = []
     for msg in req.messages:
         text = extract_text_content(msg.content).strip()
@@ -148,9 +154,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         dialogue.append("Assistant:")
         prompt = "\n\n".join(dialogue)
 
+    model_key = req.model.lower()
+    if model_key not in MODEL_MAP:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{req.model}' is not supported. Available models: {[m['id'] for m in AVAILABLE_MODELS]}"
+        )
+    target_model = MODEL_MAP[model_key]
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created_time = int(time.time())
-    target_model = MODEL_MAP.get(req.model.lower(), "gpt-6-luna")
 
     # Streaming Mode
     if req.stream:
@@ -170,7 +182,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 }
                 yield f"data: {json.dumps(first_chunk)}\n\n"
 
-                # Stream token deltas with client disconnect checking (Fixes H6)
+                # Stream token deltas with client disconnect checking (Fixes H6, N2)
                 async for token in bridge.ask_stream(prompt, target_model, is_aborted=request.is_disconnected):
                     chunk = {
                         "id": completion_id,
@@ -199,6 +211,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
                 }
                 yield f"data: {json.dumps(stop_chunk)}\n\n"
                 yield "data: [DONE]\n\n"
+            except (asyncio.CancelledError, GeneratorExit):
+                logger.info(f"Client disconnected; terminated stream {completion_id}.")
+                return
             except Exception as e:
                 logger.error(f"Error in stream generation: {e}")
                 err_chunk = {
@@ -257,6 +272,9 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     except TimeoutError as te:
         logger.error(f"Bridge busy/timeout: {te}")
         raise HTTPException(status_code=503, detail="Server busy: Bridge queue timeout.")
+    except ValueError as ve:
+        logger.warning(f"Invalid model or request: {ve}")
+        raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
         logger.error(f"Error in non-streaming completion: {e}")
         raise HTTPException(status_code=500, detail=str(e))

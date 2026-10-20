@@ -115,6 +115,14 @@ class DuckAIBridge:
                 return
 
             logger.info(f"Initializing DuckAI Browser Bridge (headless={self.headless})...")
+            
+            # Clean up previous browser instance if re-initializing
+            if self.browser:
+                try:
+                    await self.browser.close()
+                except Exception:
+                    pass
+
             if not self.playwright:
                 self.playwright = await async_playwright().start()
             
@@ -222,12 +230,14 @@ class DuckAIBridge:
             logger.info("DuckAI Browser Bridge ready!")
 
     async def switch_model(self, target_model: str):
-        """Switches the active model in DuckAI's UI using direct testids."""
-        model_key = MODEL_MAP.get(target_model.lower(), "gpt-6-luna")
+        """Switches the active model in DuckAI's UI using direct testids (Fixes H7)."""
+        model_key = MODEL_MAP.get(target_model.lower())
+        if not model_key:
+            raise ValueError(f"Requested model '{target_model}' is not supported.")
+
         testid = MODEL_TESTIDS.get(model_key)
         if not testid:
-            logger.warning(f"No testid found for model '{target_model}', defaulting to gpt-6-luna")
-            return
+            raise ValueError(f"No testid mapped for model '{model_key}'.")
 
         model_keywords = {
             "gpt-6-luna": ["Luna", "GPT-6"],
@@ -239,58 +249,54 @@ class DuckAIBridge:
         }
         target_words = model_keywords.get(model_key, ["Luna"])
 
-        try:
-            buttons = await self.page.query_selector_all("button")
-            model_btn = None
-            for b in buttons:
-                txt = (await b.inner_text()).strip()
-                if any(w in txt for w in ["Luna", "mini", "Haiku", "Mistral", "120B", "Gemma"]):
-                    model_btn = b
-                    break
+        buttons = await self.page.query_selector_all("button")
+        model_btn = None
+        for b in buttons:
+            txt = (await b.inner_text()).strip()
+            if any(w in txt for w in ["Luna", "mini", "Haiku", "Mistral", "120B", "Gemma"]):
+                model_btn = b
+                break
 
-            if not model_btn:
-                logger.warning("Model selector button not found in UI.")
-                return
+        if not model_btn:
+            raise RuntimeError("Model selector button not found in DuckAI UI.")
 
-            current_txt = (await model_btn.inner_text()).strip()
-            if any(w.lower() in current_txt.lower() for w in target_words):
-                return  # Model is already active
+        current_txt = (await model_btn.inner_text()).strip()
+        if any(w.lower() in current_txt.lower() for w in target_words):
+            return  # Model is already active
 
-            # Open dropdown
-            await model_btn.click()
-            await asyncio.sleep(0.4)
+        # Open dropdown
+        await model_btn.click()
+        await asyncio.sleep(0.4)
 
-            # Click target row
-            row = await self.page.query_selector(f"[data-testid='{testid}']")
-            if row:
-                await row.click()
-                await asyncio.sleep(0.6)
-                logger.info(f"Switched model to {model_key} (testid: {testid})")
-            else:
-                logger.warning(f"Row {testid} not found in dropdown.")
-                await self.page.mouse.click(10, 10)
-        except Exception as e:
-            logger.warning(f"Notice on model switch: {e}")
+        # Click target row
+        row = await self.page.query_selector(f"[data-testid='{testid}']")
+        if row:
+            await row.click()
+            await asyncio.sleep(0.6)
+            logger.info(f"Switched model to {model_key} (testid: {testid})")
+        else:
+            await self.page.mouse.click(10, 10)
+            raise ValueError(f"Model row '{testid}' was not found in DuckAI dropdown.")
 
     async def new_chat(self):
-        """Resets the conversation and ensures textarea is empty (Fixes H4)."""
+        """Resets the conversation and ensures textarea is empty and verified (Fixes H4)."""
         try:
             new_btn = await self.page.query_selector("button:has-text('New Chat'), button[aria-label*='New Chat']")
             if new_btn:
                 await new_btn.click()
                 await asyncio.sleep(0.5)
             # Ensure textarea is clear
-            textarea = await self.page.query_selector("textarea")
+            textarea = await self.page.wait_for_selector("textarea", timeout=5000)
             if textarea:
                 await textarea.fill("")
         except Exception as e:
             logger.warning(f"Notice on new_chat reset: {e}")
 
     async def stop_generation(self):
-        """Clicks Stop generating if active and clears current generation (Fixes H6)."""
+        """Clicks Stop generating if active and clears current generation (Fixes H6, N2)."""
         try:
             self.active_generation_id = None
-            stop_btn = await self.page.query_selector("button[aria-label*='Stop generating']")
+            stop_btn = await self.page.query_selector("button[aria-label*='Stop generating'], button:has-text('Stop generating')")
             if stop_btn:
                 await stop_btn.click()
                 logger.info("Clicked 'Stop generating' button on DuckAI.")
@@ -304,13 +310,16 @@ class DuckAIBridge:
         is_aborted: Optional[Callable[[], Awaitable[bool]]] = None
     ) -> AsyncGenerator[str, None]:
         """Submits prompt to DuckAI and yields token chunks asynchronously with generation safety."""
-        # Acquisition timeout to prevent indefinite head-of-line blocking (Fixes H5)
+        # Safe lock acquisition without cancellation leak race (Fixes N1)
+        acquired = False
         try:
-            await asyncio.wait_for(self.lock.acquire(), timeout=30.0)
-        except asyncio.TimeoutError:
-            raise TimeoutError("Server busy: Bridge queue timeout waiting for lock.")
+            try:
+                async with asyncio.timeout(30.0):
+                    await self.lock.acquire()
+                    acquired = True
+            except TimeoutError:
+                raise TimeoutError("Server busy: Bridge queue timeout waiting for lock.")
 
-        try:
             if not self._is_ready or not self.page or self.page.is_closed():
                 await self.initialize()
 
@@ -339,6 +348,8 @@ class DuckAIBridge:
                 else:
                     await textarea.press("Enter")
 
+                has_received_token = False
+
                 # Stream tokens from queue
                 while True:
                     # Check if client disconnected mid-stream (Fixes H6)
@@ -347,22 +358,32 @@ class DuckAIBridge:
                         await self.stop_generation()
                         break
 
+                    # Split timeout: 35s for first token (reasoning/search lag), 15s between subsequent tokens (Fixes H3)
+                    wait_timeout = 15.0 if has_received_token else 35.0
+
                     try:
-                        item = await asyncio.wait_for(queue.get(), timeout=25.0)
+                        item = await asyncio.wait_for(queue.get(), timeout=wait_timeout)
                         if item is None:
                             break  # [DONE] received from DuckAI
                         if isinstance(item, Exception):
                             # Surface DuckAI error frame (Fixes H2)
                             raise item
+                        has_received_token = True
                         yield item
                     except asyncio.TimeoutError:
                         logger.warning(f"Generation {gen_id} timed out waiting for token chunk.")
                         break
+            except (asyncio.CancelledError, GeneratorExit):
+                # Cancellation-aware cleanup on disconnect (Fixes N2)
+                logger.info(f"Stream cancelled for generation {gen_id}. Stopping browser...")
+                await self.stop_generation()
+                raise
             finally:
                 self.active_generation_id = None
                 self.active_queue = None
         finally:
-            self.lock.release()
+            if acquired:
+                self.lock.release()
 
     async def close(self):
         logger.info("Closing DuckAI bridge...")
