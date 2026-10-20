@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DuckAI - OpenAI Compatible Proxy UI</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            brand: { 500: '#ff7043', 600: '#f4511e' }
+          }
+        }
+      }
+    }
+  </script>
+  <style>
+    pre code { border-radius: 0.5rem; }
+    .prose p { margin-bottom: 0.75rem; }
+    .prose p:last-child { margin-bottom: 0; }
+  </style>
+</head>
+<body class="bg-gray-950 text-gray-100 flex flex-col h-screen overflow-hidden font-sans">
+
+  <!-- Header -->
+  <header class="border-b border-gray-800 bg-gray-900/60 backdrop-blur px-6 py-3 flex items-center justify-between shrink-0">
+    <div class="flex items-center space-x-3">
+      <div class="w-8 h-8 rounded-lg bg-gradient-to-tr from-orange-500 to-amber-400 flex items-center justify-center font-bold text-gray-950 text-lg shadow-md">
+        🦆
+      </div>
+      <div>
+        <h1 class="font-bold text-base leading-tight tracking-wide flex items-center gap-2">
+          DuckAI Proxy <span class="text-xs px-2 py-0.5 rounded-full bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">Online</span>
+        </h1>
+        <p class="text-xs text-gray-400">OpenAI API Bridge v1.0.0</p>
+      </div>
+    </div>
+
+    <!-- Controls -->
+    <div class="flex items-center space-x-3">
+      <!-- Model Dropdown -->
+      <div class="flex items-center space-x-2 bg-gray-800/80 px-3 py-1.5 rounded-lg border border-gray-700">
+        <span class="text-xs text-gray-400 font-medium">Model:</span>
+        <select id="modelSelect" class="bg-transparent text-sm font-semibold text-orange-400 focus:outline-none cursor-pointer">
+          <option value="gpt-6-luna" class="bg-gray-800 text-gray-100">GPT-6 Luna (Default)</option>
+          <option value="claude-haiku-4.5" class="bg-gray-800 text-gray-100">Claude Haiku 4.5</option>
+          <option value="gpt-5.4-mini" class="bg-gray-800 text-gray-100">GPT-5.4 mini</option>
+          <option value="mistral-small-4" class="bg-gray-800 text-gray-100">Mistral Small 4</option>
+          <option value="gpt-oss-120b" class="bg-gray-800 text-gray-100">GPT-OSS 120B</option>
+          <option value="gemma-4-31b" class="bg-gray-800 text-gray-100">Gemma 4 31B</option>
+        </select>
+      </div>
+
+      <!-- New Chat Button -->
+      <button id="newChatBtn" class="bg-gray-800 hover:bg-gray-700 text-gray-200 text-xs px-3 py-2 rounded-lg border border-gray-700 transition flex items-center gap-1.5 font-medium">
+        <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4"/></svg>
+        New Chat
+      </button>
+    </div>
+  </header>
+
+  <!-- Chat History Container -->
+  <main id="chatBox" class="flex-1 overflow-y-auto p-4 md:p-6 space-y-6 max-w-4xl w-full mx-auto">
+    <!-- Welcome Greeting -->
+    <div id="welcomeMessage" class="flex flex-col items-center justify-center text-center mt-20 space-y-4">
+      <div class="w-16 h-16 rounded-2xl bg-orange-500/10 border border-orange-500/20 flex items-center justify-center text-3xl shadow-inner">
+        🦆
+      </div>
+      <div>
+        <h2 class="text-xl font-bold text-gray-200">Welcome to DuckAI Proxy GUI</h2>
+        <p class="text-sm text-gray-400 max-w-md mt-1">
+          Chat freely with GPT-6 Luna, Claude Haiku 4.5, Mistral, and open-source models with high speed and zero limits.
+        </p>
+      </div>
+      <div class="flex flex-wrap gap-2 justify-center max-w-lg mt-2">
+        <button onclick="setPrompt('Explain quantum computing in simple words.')" class="text-xs bg-gray-900 border border-gray-800 hover:border-orange-500/40 text-gray-300 px-3 py-2 rounded-lg transition">"Explain quantum computing..."</button>
+        <button onclick="setPrompt('Write a clean Python script for quicksort.')" class="text-xs bg-gray-900 border border-gray-800 hover:border-orange-500/40 text-gray-300 px-3 py-2 rounded-lg transition">"Write quicksort in Python..."</button>
+        <button onclick="setPrompt('Give 5 high-impact business ideas using AI.')" class="text-xs bg-gray-900 border border-gray-800 hover:border-orange-500/40 text-gray-300 px-3 py-2 rounded-lg transition">"5 business ideas using AI..."</button>
+      </div>
+    </div>
+  </main>
+
+  <!-- Input Bar -->
+  <footer class="border-t border-gray-800/80 bg-gray-900/60 backdrop-blur p-4 shrink-0">
+    <div class="max-w-4xl mx-auto flex flex-col space-y-2">
+      <form id="chatForm" class="relative flex items-center">
+        <textarea
+          id="userInput"
+          rows="1"
+          placeholder="Ask DuckAI anything..."
+          class="w-full bg-gray-800/90 border border-gray-700/80 rounded-xl px-4 py-3.5 pr-24 text-sm text-gray-100 placeholder-gray-500 focus:outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500 resize-none max-h-36 shadow-lg transition"
+        ></textarea>
+        
+        <div class="absolute right-2 flex items-center space-x-1.5">
+          <button
+            type="submit"
+            id="sendBtn"
+            class="bg-gradient-to-r from-orange-500 to-amber-500 hover:from-orange-600 hover:to-amber-600 text-gray-950 p-2 rounded-lg font-semibold transition disabled:opacity-40 disabled:cursor-not-allowed shadow"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M14 5l7 7m0 0l-7 7m7-7H3"/></svg>
+          </button>
+        </div>
+      </form>
+      <div class="flex items-center justify-between text-[11px] text-gray-500 px-1">
+        <span>Powered by DuckAI Reverse Engineering Engine</span>
+        <span>OpenAI Endpoint: <code>POST /v1/chat/completions</code></span>
+      </div>
+    </div>
+  </footer>
+
+  <script>
+    const chatBox = document.getElementById('chatBox');
+    const chatForm = document.getElementById('chatForm');
+    const userInput = document.getElementById('userInput');
+    const sendBtn = document.getElementById('sendBtn');
+    const modelSelect = document.getElementById('modelSelect');
+    const newChatBtn = document.getElementById('newChatBtn');
+    const welcomeMessage = document.getElementById('welcomeMessage');
+
+    let messages = [];
+    let isGenerating = false;
+
+    // Auto resize textarea
+    userInput.addEventListener('input', () => {
+      userInput.style.height = 'auto';
+      userInput.style.height = Math.min(userInput.scrollHeight, 140) + 'px';
+    });
+
+    // Enter to submit (Shift+Enter for newline)
+    userInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        chatForm.dispatchEvent(new Event('submit'));
+      }
+    });
+
+    function setPrompt(text) {
+      userInput.value = text;
+      userInput.focus();
+      userInput.dispatchEvent(new Event('input'));
+    }
+
+    newChatBtn.addEventListener('click', () => {
+      messages = [];
+      chatBox.innerHTML = '';
+      if (welcomeMessage) chatBox.appendChild(welcomeMessage);
+      userInput.value = '';
+      userInput.focus();
+    });
+
+    function appendMessage(role, content) {
+      if (welcomeMessage && welcomeMessage.parentNode === chatBox) {
+        welcomeMessage.remove();
+      }
+
+      const msgDiv = document.createElement('div');
+      msgDiv.className = `flex ${role === 'user' ? 'justify-end' : 'justify-start'}`;
+
+      const bubble = document.createElement('div');
+      bubble.className = role === 'user'
+        ? 'bg-orange-600 text-white rounded-2xl rounded-tr-sm px-4 py-3 max-w-[85%] text-sm shadow-md'
+        : 'bg-gray-800/90 border border-gray-700/60 rounded-2xl rounded-tl-sm px-4 py-3 max-w-[85%] text-sm text-gray-100 shadow-md prose prose-invert overflow-x-auto';
+
+      if (role === 'user') {
+        bubble.textContent = content;
+      } else {
+        bubble.innerHTML = marked.parse(content);
+        bubble.querySelectorAll('pre code').forEach((block) => {
+          hljs.highlightElement(block);
+        });
+      }
+
+      msgDiv.appendChild(bubble);
+      chatBox.appendChild(msgDiv);
+      chatBox.scrollTop = chatBox.scrollHeight;
+      return bubble;
+    }
+
+    chatForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const prompt = userInput.value.trim();
+      if (!prompt || isGenerating) return;
+
+      userInput.value = '';
+      userInput.style.height = 'auto';
+      isGenerating = true;
+      sendBtn.disabled = true;
+
+      // Add user message to UI & history
+      appendMessage('user', prompt);
+      messages.push({ role: 'user', content: prompt });
+
+      // Add empty assistant bubble
+      const assistantBubble = appendMessage('assistant', '...');
+      let assistantText = '';
+
+      try {
+        const response = await fetch('/v1/chat/completions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            model: modelSelect.value,
+            messages: messages,
+            stream: true
+          })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Server returned HTTP ${response.status}`);
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split('\n');
+          buffer = lines.pop();
+
+          for (const line of lines) {
+            if (line.startsWith('data: ')) {
+              const dataStr = line.slice(6).trim();
+              if (dataStr === '[DONE]') break;
+              try {
+                const parsed = JSON.parse(dataStr);
+                const delta = parsed.choices?.[0]?.delta?.content;
+                if (delta) {
+                  assistantText += delta;
+                  assistantBubble.innerHTML = marked.parse(assistantText);
+                  assistantBubble.querySelectorAll('pre code').forEach((block) => {
+                    hljs.highlightElement(block);
+                  });
+                  chatBox.scrollTop = chatBox.scrollHeight;
+                }
+              } catch (err) {}
+            }
+          }
+        }
+
+        messages.push({ role: 'assistant', content: assistantText });
+      } catch (err) {
+        assistantBubble.innerHTML = `<span class="text-rose-400">Error: ${err.message}</span>`;
+      } finally {
+        isGenerating = false;
+        sendBtn.disabled = false;
+        userInput.focus();
+      }
+    });
+  </script>
+</body>
+</html>

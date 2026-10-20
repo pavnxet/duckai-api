@@ -1,0 +1,24 @@
+# Agent and Memory Isolation (Never commit to Git)
+AGENTS.md
+learning/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Environment and secrets
+.env
+.env.local
+*.log
+
+# Editor & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
