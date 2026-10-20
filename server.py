@@ -1,3 +1,8 @@
+# ==========================================================
+#  duckai-api
+#  https://github.com/pavnxet/duckai-api
+# ==========================================================
+
 import asyncio
 import hmac
 import json
