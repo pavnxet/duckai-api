@@ -60,7 +60,41 @@ DuckAI API automatically maps standard OpenAI model names to Duck.ai models:
 
 ## 🚀 Quick Start
 
-### Option A: Local Python Setup
+### Option A: Windows Launcher (`start.bat`)
+
+The fastest path on Windows. Double-click `start.bat`, or run it from a terminal:
+
+```bat
+start.bat
+```
+
+It checks the environment first (Python, dependencies, Chrome/Edge, whether the port is already in use), prints a colour-coded connection card, then launches the server:
+
+```
+  CONNECT
+    Base URL   http://localhost:3006/v1
+    API key    not required  - no Authorization header needed
+    Model      gpt-6-luna  - or any id from MODELS below
+    Web GUI    http://localhost:3006/
+    API docs   http://localhost:3006/docs
+    Health     http://localhost:3006/health
+```
+
+The card also lists every model and alias plus ready-to-paste **curl**, **PowerShell**, and **Python SDK** examples.
+
+| Flag | Effect |
+|---|---|
+| `start.bat --port 8080` | Serve on another port (all printed URLs update) |
+| `start.bat --visible` | Show the browser window (`HEADLESS=false`) |
+| `start.bat --key <token>` | Require `Authorization: Bearer <token>` on `/v1/*` |
+| `start.bat --install` | Create `.venv` and install dependencies, without prompting |
+| `start.bat --help` | Usage |
+
+> If dependencies are missing it offers to create `.venv` and install them for you. The script never stores or prints an API key — pass it with `--key` or set `API_KEY` in your environment.
+
+---
+
+### Option B: Local Python Setup
 
 1. **Clone the repository:**
    ```bash
@@ -86,7 +120,7 @@ The server will initialize the browser bridge and be ready on **`http://localhos
 
 ---
 
-### Option B: Docker & Docker Compose
+### Option C: Docker & Docker Compose
 
 Deploy with a single command:
 
