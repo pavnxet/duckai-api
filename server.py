@@ -117,10 +117,25 @@ async def serve_index():
 
 @app.get("/health")
 async def health_check():
+    """Liveness + readiness. `status` is unhealthy when the browser page cannot serve a chat."""
+    ready = bridge.is_ready()
+    responsive = await bridge.probe() if ready else False
+
+    if not ready or not responsive:
+        status = "unhealthy"
+    elif bridge.consecutive_failures > 0:
+        status = "degraded"
+    else:
+        status = "healthy"
+
     return {
-        "status": "healthy",
+        "status": status,
         "service": "duckai-api",
-        "bridge_ready": bridge._is_ready,
+        "bridge_ready": ready,
+        "bridge_responsive": responsive,
+        "consecutive_failures": bridge.consecutive_failures,
+        "last_error": bridge.last_error,
+        "last_success_at": bridge.last_success_at,
         "auth_enabled": bool(API_KEY),
         "models_count": len(AVAILABLE_MODELS),
         "requests_processed": bridge.request_count,

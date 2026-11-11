@@ -50,7 +50,7 @@ DuckAI API automatically maps standard OpenAI model names to Duck.ai models:
 | Duck.ai Model | Aliases / Model IDs | Provider | Description |
 |---|---|---|---|
 | **GPT-6 Luna** | `gpt-6-luna`, `gpt-6`, `luna`, `default` | OpenAI | Flagship general-purpose model, high speed. |
-| **Claude Haiku 4.5** | `claude-haiku-4.5`, `claude-3-5-haiku`, `claude` | Anthropic | Fast, concise reasoning and code analysis. |
+| **Claude Haiku 5.5** | `claude-haiku-5.5`, `claude-haiku-4.5`, `claude-3-5-haiku`, `claude` | Anthropic | Fast, concise reasoning and code analysis. |
 | **GPT-5.4 mini** | `gpt-5.4-mini`, `gpt-4o-mini`, `gpt-4o` | OpenAI | Lightweight, efficient, and fast. |
 | **Mistral Small 4** | `mistral-small-4`, `mistral` | Mistral AI | Multilingual European open-weights model. |
 | **GPT-OSS 120B** | `gpt-oss-120b`, `oss-120b` | Tinfoil | Massive open-weights model. |
@@ -109,7 +109,7 @@ Connect any desktop app by entering:
 - **API Provider**: `OpenAI API`
 - **API Base URL / Host**: `http://localhost:3006/v1` (or `http://localhost:3006`)
 - **API Key**: Any dummy string (e.g. `sk-duckai-proxy`) or your configured `API_KEY`.
-- **Model**: Select `gpt-6-luna`, `claude-haiku-4.5`, or `mistral-small-4`.
+- **Model**: Select `gpt-6-luna`, `claude-haiku-5.5`, or `mistral-small-4`.
 
 ---
 
@@ -125,7 +125,7 @@ client = OpenAI(
 
 # Streaming completion
 response = client.chat.completions.create(
-    model="claude-haiku-4.5",
+    model="claude-haiku-5.5",
     messages=[
         {"role": "system", "content": "You are a concise engineering assistant."},
         {"role": "user", "content": "Explain quantum computing in 20 words."}
@@ -230,6 +230,10 @@ curl http://localhost:3006/health
   "status": "healthy",
   "service": "duckai-api",
   "bridge_ready": true,
+  "bridge_responsive": true,
+  "consecutive_failures": 0,
+  "last_error": null,
+  "last_success_at": 1794377280.89,
   "auth_enabled": false,
   "models_count": 6,
   "requests_processed": 42,
@@ -237,6 +241,14 @@ curl http://localhost:3006/health
   "memory_recycling": true
 }
 ```
+
+`status` reflects the **browser bridge**, not just the HTTP server, so a stale page is no longer reported as healthy:
+
+| `status` | Meaning |
+|---|---|
+| `healthy` | Bridge page is open, responsive (chat input + model picker found), and the last completion succeeded. |
+| `degraded` | Bridge is responsive but completions are failing (`consecutive_failures > 0`); inspect `last_error`. |
+| `unhealthy` | Bridge page is closed or cannot serve a chat. A recovery attempt is made on the next request. |
 
 ---
 

@@ -29,11 +29,12 @@ MODEL_MAP = {
     "gpt-4o": "gpt-5.4-mini",
     "gpt-3.5-turbo": "gpt-5.4-mini",
     
-    # Claude Haiku
-    "claude-haiku-4.5": "claude-haiku-4.5",
-    "claude-3-5-haiku": "claude-haiku-4.5",
-    "claude-haiku": "claude-haiku-4.5",
-    "claude": "claude-haiku-4.5",
+    # Claude Haiku (Duck.ai now serves Haiku 5.5; 4.5 kept as a legacy alias)
+    "claude-haiku-5.5": "claude-haiku-5.5",
+    "claude-haiku-4.5": "claude-haiku-5.5",
+    "claude-3-5-haiku": "claude-haiku-5.5",
+    "claude-haiku": "claude-haiku-5.5",
+    "claude": "claude-haiku-5.5",
     
     # Mistral
     "mistral-small-4": "mistral-small-4",
@@ -49,11 +50,28 @@ MODEL_MAP = {
 MODEL_TESTIDS = {
     "gpt-6-luna": "model-picker-row-gpt-6-luna",
     "gpt-5.4-mini": "model-picker-row-gpt-5.4-mini",
-    "claude-haiku-4.5": "model-picker-row-claude-haiku-4-5",
+    "claude-haiku-5.5": "model-picker-row-claude-haiku-5-5",
     "mistral-small-4": "model-picker-row-mistral-small-2603",
     "gpt-oss-120b": "model-picker-row-tinfoil/gpt-oss-120b",
     "gemma-4-31b": "model-picker-row-tinfoil/gemma4-31b"
 }
+
+# Labels Duck.ai renders on the model-picker button per model. The button text is
+# abbreviated (e.g. "6 Luna", "gpt-oss"), so matching it is only used as a fast
+# "already selected" shortcut - the authoritative selector is MODEL_TESTIDS.
+MODEL_KEYWORDS = {
+    "gpt-6-luna": ["Luna", "GPT-6"],
+    "gpt-5.4-mini": ["5.4 mini", "GPT-5.4"],
+    "claude-haiku-5.5": ["Haiku", "Claude"],
+    "mistral-small-4": ["Mistral"],
+    "gpt-oss-120b": ["oss 120B", "120B", "oss"],
+    "gemma-4-31b": ["Gemma"]
+}
+
+MODEL_BUTTON_SELECTORS = [
+    "[data-testid='model-picker-button']",
+    "button[aria-label*='Model' i]",
+]
 
 AVAILABLE_MODELS = [
     {
@@ -64,11 +82,11 @@ AVAILABLE_MODELS = [
         "description": "GPT-6 Luna - Best for everyday use and general queries."
     },
     {
-        "id": "claude-haiku-4.5",
+        "id": "claude-haiku-5.5",
         "object": "model",
         "owned_by": "duckai",
         "permission": [],
-        "description": "Claude Haiku 4.5 - Fast, concise reasoning and analysis."
+        "description": "Claude Haiku 5.5 - Fast, concise reasoning and analysis. (claude-haiku-4.5 alias)"
     },
     {
         "id": "gpt-5.4-mini",
@@ -120,6 +138,13 @@ class DuckAIBridge:
         self.max_requests_before_recycle = int(os.environ.get("RECYCLE_AFTER_REQUESTS", "100"))
         self.last_recycle_time = time.time()
         self.recycle_interval_seconds = int(os.environ.get("RECYCLE_INTERVAL_HOURS", "24")) * 3600
+
+        # Liveness tracking (exposed through /health). A stale page used to keep
+        # reporting healthy while every completion failed.
+        self.consecutive_failures = 0
+        self.last_error: Optional[str] = None
+        self.last_error_at: Optional[float] = None
+        self.last_success_at: Optional[float] = None
 
     async def _setup_page(self, page: Page):
         """Attaches python SSE bridge to page, navigates, and verifies readiness."""
@@ -266,27 +291,39 @@ class DuckAIBridge:
         if not testid:
             raise ValueError(f"No testid mapped for model '{model_key}'.")
 
-        model_keywords = {
-            "gpt-6-luna": ["Luna", "GPT-6"],
-            "gpt-5.4-mini": ["5.4 mini", "GPT-5.4"],
-            "claude-haiku-4.5": ["Haiku", "Claude"],
-            "mistral-small-4": ["Mistral"],
-            "gpt-oss-120b": ["oss 120B", "120B"],
-            "gemma-4-31b": ["Gemma"]
-        }
-        target_words = model_keywords.get(model_key, ["Luna"])
+        try:
+            await self._apply_model(model_key, testid)
+        except Exception as e:
+            # A desynced page (stale DOM, leftover overlay, renamed button label) used to
+            # brick the bridge permanently. Recycle once and retry instead of failing forever.
+            logger.warning(f"Model switch to {model_key} failed ({e}); recycling page and retrying once...")
+            await self.recycle_page()
+            await self.new_chat()
+            await self._apply_model(model_key, testid)
 
-        buttons = await self.page.query_selector_all("button")
-        model_btn = None
-        for b in buttons:
-            txt = (await b.inner_text()).strip()
-            if any(w in txt for w in ["Luna", "mini", "Haiku", "Mistral", "120B", "Gemma"]):
-                model_btn = b
-                break
+    async def _find_model_button(self):
+        """Locates the model picker button by testid, falling back to a keyword scan."""
+        for selector in MODEL_BUTTON_SELECTORS:
+            btn = await self.page.query_selector(selector)
+            if btn:
+                return btn
 
+        for b in await self.page.query_selector_all("button"):
+            try:
+                txt = (await b.inner_text()).strip()
+            except Exception:
+                continue
+            if any(w in txt for w in ["Luna", "mini", "Haiku", "Mistral", "oss", "Gemma"]):
+                return b
+        return None
+
+    async def _apply_model(self, model_key: str, testid: str):
+        """Opens the model dropdown and clicks the row for model_key."""
+        model_btn = await self._find_model_button()
         if not model_btn:
             raise RuntimeError("Model selector button not found in DuckAI UI.")
 
+        target_words = MODEL_KEYWORDS.get(model_key, [])
         current_txt = (await model_btn.inner_text()).strip()
         if any(w.lower() in current_txt.lower() for w in target_words):
             return  # Model is already active
@@ -318,6 +355,39 @@ class DuckAIBridge:
                 await textarea.fill("")
         except Exception as e:
             logger.warning(f"Notice on new_chat reset: {e}")
+
+    def is_ready(self) -> bool:
+        """True only when the bridge is initialized and its page is still open."""
+        return bool(self._is_ready and self.page is not None and not self.page.is_closed())
+
+    async def probe(self) -> bool:
+        """Live check: can the page still run a chat (input + model picker present)?"""
+        if not self.is_ready():
+            return False
+        try:
+            async with asyncio.timeout(5.0):
+                if await self.page.query_selector("textarea") is None:
+                    return False
+                for selector in MODEL_BUTTON_SELECTORS:
+                    if await self.page.query_selector(selector):
+                        return True
+                return False
+        except Exception as e:
+            logger.warning(f"Health probe failed: {e}")
+            return False
+
+    def note_success(self):
+        """Records a healthy completion (clears degraded state)."""
+        self.consecutive_failures = 0
+        self.last_error = None
+        self.last_error_at = None
+        self.last_success_at = time.time()
+
+    def note_failure(self, error: BaseException):
+        """Records a bridge failure so /health stops claiming everything is fine."""
+        self.consecutive_failures += 1
+        self.last_error = str(error)[:200]
+        self.last_error_at = time.time()
 
     async def stop_generation(self):
         """Clicks Stop generating if active and clears current generation (Fixes H6, N2)."""
@@ -414,6 +484,16 @@ class DuckAIBridge:
             finally:
                 self.active_generation_id = None
                 self.active_queue = None
+
+            # Reached only when the generation finished without raising.
+            self.note_success()
+        except (asyncio.CancelledError, GeneratorExit):
+            raise
+        except Exception as e:
+            # Queue contention is not a bridge fault; everything else is worth reporting.
+            if "Bridge queue timeout" not in str(e):
+                self.note_failure(e)
+            raise
         finally:
             if acquired:
                 self.lock.release()
